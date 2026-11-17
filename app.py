@@ -6,92 +6,142 @@ import streamlit as st
 
 st.set_page_config(page_title='Transaction Monitor', layout='wide')
 
-# ---- load the trained model (made in the Colab notebook) ----
-bundle = joblib.load('model.joblib')
-model = bundle['model']
-history_scores = bundle['history_scores']
-features = bundle['features']
+@st.cache_resource
+def load_model():
+    bundle = joblib.load('model.joblib')
+    return bundle['model'], np.asarray(bundle['history_scores']), bundle['features']
 
+try:
+    model, history_scores, features = load_model()
+    if len(history_scores) == 0 or not np.isfinite(history_scores).all():
+        raise ValueError('Historical scores are missing or invalid.')
+except Exception:
+    st.error('Monitoring unavailable: the trained model or historical scores could not be loaded. Contact the app owner; do not treat transactions as cleared.')
+    st.stop()
 
-def score(amount, typical, last_hour, gap, age):
-    """Turn one transaction into the five features and return its anomaly score."""
+# Demo convention only: enable this rule if the data source defines 999 as missing.
+PLACEHOLDERS = {'transactions_last_hour': [999]}
+FIELDS = ['amount', 'customer_typical_amount', 'transactions_last_hour', 'minutes_since_previous', 'account_age_days']
+LABELS = ['Amount', 'Customer typical amount', 'Transactions last hour', 'Minutes since previous transaction', 'Account age']
+
+def validate(values):
+    errors = []
+    for field, label in zip(FIELDS, LABELS):
+        value = values.get(field)
+        try:
+            number = float(value)
+        except (TypeError, ValueError, OverflowError):
+            errors.append(f'{label}: missing or not numeric.')
+            continue
+        if not np.isfinite(number):
+            errors.append(f'{label}: missing or not finite.')
+        elif number in PLACEHOLDERS.get(field, []):
+            errors.append(f'{label}: {number:g} is a documented missing-value code in this demo.')
+        elif number < 0 or (field in FIELDS[:2] and number == 0):
+            errors.append(f'{label}: must be positive.' if field in FIELDS[:2] else f'{label}: cannot be negative.')
+        elif field in [FIELDS[2], FIELDS[4]] and not number.is_integer():
+            errors.append(f'{label}: must be a whole number.')
+    # Demo assumption: count refers to previous transactions within the last 60 minutes.
+    # A recent previous transaction requires at least one transaction in that window.
+    try:
+        gap = float(values['minutes_since_previous'])
+        count = float(values['transactions_last_hour'])
+        if np.isfinite(gap) and np.isfinite(count) and 0 <= gap < 60 and count == 0:
+            errors.append('Inconsistent activity: previous transaction was less than 60 minutes ago, but transactions in the last hour is 0. Verify both fields against the transaction history.')
+    except (TypeError, ValueError, OverflowError, KeyError):
+        pass
+    return errors
+
+def score(values):
+    amount, typical, last_hour, gap, age = [float(values[k]) for k in FIELDS]
     row = pd.DataFrame([{
-        'log_amount': np.log1p(amount),
-        'amount_ratio': amount / typical,
-        'transactions_last_hour': last_hour,
-        'log_gap': np.log1p(gap),
-        'log_age': np.log1p(age),
+        'log_amount': np.log1p(amount), 'amount_ratio': amount / typical,
+        'transactions_last_hour': last_hour, 'log_gap': np.log1p(gap), 'log_age': np.log1p(age)
     }])[features]
-    return -model.score_samples(row)[0]
+    if not np.isfinite(row.to_numpy(dtype=float)).all():
+        raise ValueError('Feature values are not finite.')
+    result = float(-model.score_samples(row)[0])
+    if not np.isfinite(result):
+        raise ValueError('The model returned an invalid score.')
+    return result
 
+def show_result(s, cutoff, prefix=''):
+    if s > cutoff:
+        st.warning(f'{prefix}NEEDS HUMAN REVIEW (score {s:.3f}, cutoff {cutoff:.3f}). This is unusual activity, not a fraud probability or confirmed fraud. Check transaction details and supporting evidence before taking action.')
+    else:
+        st.info(f'{prefix}NOT FLAGGED BY MODEL (score {s:.3f}, cutoff {cutoff:.3f}). This does not verify that the transaction is legitimate. Follow normal controls and investigate other warning signs.')
 
-# ---- sidebar: the review budget ----
 st.title('Transaction Monitor')
-st.write('Each new transaction is scored by Isolation Forest. '
-         'If the score is above the cutoff, it goes to review.')
-
-pct = st.sidebar.slider('Send this share of transactions to review (%)', 1, 10, 4)
+st.write('Isolation Forest identifies unusual transactions for human review; it does not determine fraud.')
+st.caption('Demo data rules: 999 in Transactions last hour means missing; the count covers previous transactions in the last 60 minutes. Confirm these definitions with the source data dictionary before production use. Other fields may legitimately equal 999.')
+pct = st.sidebar.slider('Historical share above cutoff (%)', 1, 10, 4)
 cutoff = np.percentile(history_scores, 100 - pct)
 st.sidebar.write(f'Score cutoff: **{cutoff:.3f}**')
-st.sidebar.caption('The cutoff is set from past transactions: '
-                   'a transaction scoring above it is more unusual than the top '
-                   f'{pct}% of history.')
+st.sidebar.caption('Historical threshold, not a guarantee of current review volume or a fraud probability.')
 
 tab1, tab2 = st.tabs(['Check one transaction', 'Live stream'])
-
-# ---- tab 1: type in one transaction ----
 with tab1:
     c1, c2 = st.columns(2)
-    amount = c1.number_input('Amount ($)', min_value=1.0, value=60.0)
-    typical = c1.number_input("Customer's typical amount ($)", min_value=1.0, value=50.0)
+    amount = c1.number_input('Amount ($)', min_value=0.0, value=60.0)
+    typical = c1.number_input("Customer's typical amount ($)", min_value=0.0, value=50.0)
     last_hour = c1.number_input('Transactions in the last hour', min_value=0, value=1)
     gap = c2.number_input('Minutes since previous transaction', min_value=0.0, value=120.0)
     age = c2.number_input('Account age (days)', min_value=0, value=700)
-
     if st.button('Score this transaction'):
-        s = score(amount, typical, last_hour, gap, age)
-        if s > cutoff:
-            st.error(f'REVIEW  (score {s:.3f}, cutoff {cutoff:.3f})')
+        values = dict(zip(FIELDS, [amount, typical, last_hour, gap, age]))
+        errors = validate(values)
+        if errors:
+            st.error('NOT SCORED — data issue. Correct the source record and try again: ' + '; '.join(errors))
         else:
-            st.success(f'OK  (score {s:.3f}, cutoff {cutoff:.3f})')
-        share = (history_scores < s).mean() * 100
-        st.write(f'This is more unusual than {share:.0f}% of past transactions.')
+            try:
+                s = score(values)
+                show_result(s, cutoff)
+                share = (history_scores < s).mean() * 100
+                st.caption(f'More unusual than {share:.0f}% of historical transactions. This percentile is not a fraud probability.')
+            except Exception:
+                st.error('NOT SCORED — model could not process this record. Verify the source data and contact the app owner; do not treat it as cleared.')
 
-# ---- tab 2: transactions arriving one by one ----
 with tab2:
-    st.write('Press the button. The app receives the new transactions one at a time '
-             'and scores each one as it arrives.')
+    st.write('Scores synthetic transactions from new_transactions.csv, one at a time.')
     speed = st.select_slider('Speed', options=['Slow', 'Medium', 'Fast'], value='Medium')
     pause = {'Slow': 0.5, 'Medium': 0.15, 'Fast': 0.02}[speed]
-
     if st.button('Start the stream'):
-        stream = pd.read_csv('new_transactions.csv')
-        box = st.empty()
-        counts = st.empty()
-        st.subheader('Sent to review')
-        table = st.empty()
-        flagged = []
-
+        try:
+            stream = pd.read_csv('new_transactions.csv')
+        except (OSError, pd.errors.ParserError, UnicodeError) as exc:
+            st.error('STREAM NOT STARTED — transaction CSV is missing or unreadable. Ask the app owner to provide a valid new_transactions.csv and retry. No records were cleared.')
+            st.stop()
+        required = FIELDS + ['transaction_id']
+        missing = [c for c in required if c not in stream.columns]
+        if missing:
+            st.error('STREAM NOT STARTED — missing required columns: ' + ', '.join(missing) + '. Correct the CSV and retry; no records were cleared.')
+            st.stop()
+        flagged, unscored, checked = [], [], 0
+        box, counts, table = st.empty(), st.empty(), st.empty()
         for i, r in stream.iterrows():
-            s = score(r['amount'], r['customer_typical_amount'],
-                      r['transactions_last_hour'], r['minutes_since_previous'],
-                      r['account_age_days'])
-            if s > cutoff:
-                flagged.append({'id': r['transaction_id'], 'amount': r['amount'],
-                                'typical': r['customer_typical_amount'],
-                                'last_hour': r['transactions_last_hour'],
-                                'score': round(s, 3)})
-                box.error(f"{r['transaction_id']}: ${r['amount']:.2f}  ->  REVIEW (score {s:.3f})")
+            values = r.to_dict()
+            errors = validate(values)
+            if errors:
+                unscored.append({'id': r['transaction_id'], 'reason': '; '.join(errors)})
+                box.error(f"{r['transaction_id']}: NOT SCORED — data issue. Correct source data and resubmit for review. " + '; '.join(errors))
             else:
-                box.info(f"{r['transaction_id']}: ${r['amount']:.2f}  ->  ok (score {s:.3f})")
-            counts.write(f'Received **{i + 1}** of {len(stream)}.  Sent to review: **{len(flagged)}**')
+                try:
+                    s = score(values)
+                    checked += 1
+                    if s > cutoff:
+                        flagged.append({'id': r['transaction_id'], 'amount': r['amount'], 'score': round(s, 3)})
+                    with box.container():
+                        show_result(s, cutoff, prefix=f"{r['transaction_id']}: ")
+                except Exception:
+                    unscored.append({'id': r['transaction_id'], 'reason': 'Model scoring error'})
+                    box.error(f"{r['transaction_id']}: NOT SCORED — model error. Escalate for manual review and contact the app owner.")
+            counts.write(f'Processed {i + 1} of {len(stream)} | Scored: {checked} | Flagged: {len(flagged)} | Not scored: {len(unscored)}')
             if flagged:
                 table.dataframe(pd.DataFrame(flagged), hide_index=True)
             time.sleep(pause)
-
-        # at the end, look at the answer key
-        answer = stream.set_index('transaction_id')['needs_review']
-        hits = sum(answer[f['id']] for f in flagged)
-        st.success(f'Done. {len(flagged)} transactions were sent to review, '
-                   f'and {hits} of them really needed review. '
-                   f'In total, {answer.sum()} transactions needed review.')
+        if unscored:
+            st.error(f'{len(unscored)} transaction(s) were NOT scored. Correct the data and resubmit; escalate unresolved cases for manual review.')
+            st.dataframe(pd.DataFrame(unscored), hide_index=True)
+        st.info(f'Stream finished: {checked} scored, {len(flagged)} flagged, {len(unscored)} unscored. A model flag is not a fraud determination.')
+        if 'needs_review' in stream.columns and not unscored:
+            st.caption('Synthetic demonstration labels are available for separate evaluation; they are not shown as confirmed fraud decisions.')
