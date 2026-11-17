@@ -79,7 +79,10 @@ def show_result(s, cutoff, prefix=''):
 
 st.title('Transaction Monitor')
 st.write('Isolation Forest identifies unusual transactions for human review; it does not determine fraud.')
-st.caption('Demo assumptions (not verified against the source data dictionary): 999 means missing ONLY for Transactions last hour; this count includes previous transactions within the past 60 minutes, excluding the current transaction and the exact 60-minute boundary. Other fields may legitimately equal 999. Confirm these rules before production use.')
+st.caption('Demo only · Input rules are assumptions, not verified source definitions.')
+with st.expander('How are recent transactions counted?'):
+    st.write('**Transactions in the last hour** counts earlier transactions only — not the one being checked. For example, if the previous transaction was 30 minutes ago, enter at least 1; if it was 90 minutes ago, enter 0.')
+    st.write('For this demo, transactions exactly 60 minutes ago are excluded, and **999** is treated as missing only in this count field. Confirm these conventions against the data dictionary before real-world use.')
 pct = st.sidebar.slider('Historical share above cutoff (%)', 1, 10, 4)
 cutoff = np.percentile(history_scores, 100 - pct)
 st.sidebar.write(f'Score cutoff: **{cutoff:.3f}**')
@@ -90,8 +93,8 @@ with tab1:
     c1, c2 = st.columns(2)
     amount = c1.number_input('Amount ($)', min_value=0.0, value=60.0)
     typical = c1.number_input("Customer's typical amount ($)", min_value=0.0, value=50.0)
-    last_hour = c1.number_input('Transactions in the last hour', min_value=0, value=1)
-    gap = c2.number_input('Minutes since previous transaction', min_value=0.0, value=30.0)
+    last_hour = c1.number_input('Transactions in the last hour ⓘ', min_value=0, value=1, help='Count PREVIOUS transactions within the past 60 minutes, excluding the current transaction. Example: previous transaction 30 minutes ago → at least 1; 90 minutes ago → 0. This is a demo assumption, not a verified source definition.')
+    gap = c2.number_input('Minutes since previous transaction', min_value=0.0, value=30.0, help='Time elapsed since the most recent earlier transaction. Used to check consistency with the previous-transactions count.')
     age = c2.number_input('Account age (days)', min_value=0, value=700)
     if st.button('Score this transaction'):
         values = dict(zip(FIELDS, [amount, typical, last_hour, gap, age]))
