@@ -13,14 +13,18 @@ def load_model():
 
 try:
     model, history_scores, features = load_model()
-    if len(history_scores) == 0 or not np.isfinite(history_scores).all():
+    if len(history_scores) == 0 or not np.isfinite(history_scores).all() or not np.issubdtype(history_scores.dtype, np.number):
         raise ValueError('Historical scores are missing or invalid.')
 except Exception:
     st.error('Monitoring unavailable: the trained model or historical scores could not be loaded. Contact the app owner; do not treat transactions as cleared.')
     st.stop()
 
-# Demo convention only: enable this rule if the data source defines 999 as missing.
+# DEMO ASSUMPTIONS: verify with the source data dictionary before production.
+# 999 represents missing ONLY for transactions_last_hour, not every field.
 PLACEHOLDERS = {'transactions_last_hour': [999]}
+# Count refers to PREVIOUS transactions in the trailing 60 minutes (not current).
+# Exactly 60 minutes ago is excluded from this demonstration window.
+WINDOW_MINUTES = 60
 FIELDS = ['amount', 'customer_typical_amount', 'transactions_last_hour', 'minutes_since_previous', 'account_age_days']
 LABELS = ['Amount', 'Customer typical amount', 'Transactions last hour', 'Minutes since previous transaction', 'Account age']
 
@@ -41,15 +45,17 @@ def validate(values):
             errors.append(f'{label}: must be positive.' if field in FIELDS[:2] else f'{label}: cannot be negative.')
         elif field in [FIELDS[2], FIELDS[4]] and not number.is_integer():
             errors.append(f'{label}: must be a whole number.')
-    # Demo assumption: count refers to previous transactions within the last 60 minutes.
-    # A recent previous transaction requires at least one transaction in that window.
-    try:
+    # Cross-field consistency: count of PREVIOUS transactions in the last hour.
+    # If the most recent previous transaction is within the window, count >= 1.
+    # If it is outside the window, count must be 0.
+    # Skip consistency rules when either field is already invalid.
+    if not errors:
         gap = float(values['minutes_since_previous'])
         count = float(values['transactions_last_hour'])
-        if np.isfinite(gap) and np.isfinite(count) and 0 <= gap < 60 and count == 0:
-            errors.append('Inconsistent activity: previous transaction was less than 60 minutes ago, but transactions in the last hour is 0. Verify both fields against the transaction history.')
-    except (TypeError, ValueError, OverflowError, KeyError):
-        pass
+        if gap < WINDOW_MINUTES and count == 0:
+            errors.append('Inconsistent history: previous transaction was within 60 minutes, but the last-hour count is 0. Check timestamps and count in the source system.')
+        elif gap >= WINDOW_MINUTES and count > 0:
+            errors.append('Inconsistent history: previous transaction was 60 or more minutes ago, but the last-hour count is above 0. Check timestamps and count in the source system.')
     return errors
 
 def score(values):
@@ -73,7 +79,7 @@ def show_result(s, cutoff, prefix=''):
 
 st.title('Transaction Monitor')
 st.write('Isolation Forest identifies unusual transactions for human review; it does not determine fraud.')
-st.caption('Demo data rules: 999 in Transactions last hour means missing; the count covers previous transactions in the last 60 minutes. Confirm these definitions with the source data dictionary before production use. Other fields may legitimately equal 999.')
+st.caption('Demo assumptions (not verified against the source data dictionary): 999 means missing ONLY for Transactions last hour; this count includes previous transactions within the past 60 minutes, excluding the current transaction and the exact 60-minute boundary. Other fields may legitimately equal 999. Confirm these rules before production use.')
 pct = st.sidebar.slider('Historical share above cutoff (%)', 1, 10, 4)
 cutoff = np.percentile(history_scores, 100 - pct)
 st.sidebar.write(f'Score cutoff: **{cutoff:.3f}**')
@@ -85,7 +91,7 @@ with tab1:
     amount = c1.number_input('Amount ($)', min_value=0.0, value=60.0)
     typical = c1.number_input("Customer's typical amount ($)", min_value=0.0, value=50.0)
     last_hour = c1.number_input('Transactions in the last hour', min_value=0, value=1)
-    gap = c2.number_input('Minutes since previous transaction', min_value=0.0, value=120.0)
+    gap = c2.number_input('Minutes since previous transaction', min_value=0.0, value=30.0)
     age = c2.number_input('Account age (days)', min_value=0, value=700)
     if st.button('Score this transaction'):
         values = dict(zip(FIELDS, [amount, typical, last_hour, gap, age]))
@@ -111,10 +117,19 @@ with tab2:
         except (OSError, pd.errors.ParserError, UnicodeError) as exc:
             st.error('STREAM NOT STARTED — transaction CSV is missing or unreadable. Ask the app owner to provide a valid new_transactions.csv and retry. No records were cleared.')
             st.stop()
+        if stream.empty:
+            st.error('STREAM NOT STARTED — CSV has no transactions. Provide a nonempty file and retry; no records were cleared.')
+            st.stop()
+        if not stream.columns.is_unique:
+            st.error('STREAM NOT STARTED — duplicate CSV column names. Correct the file and retry; no records were cleared.')
+            st.stop()
         required = FIELDS + ['transaction_id']
         missing = [c for c in required if c not in stream.columns]
         if missing:
             st.error('STREAM NOT STARTED — missing required columns: ' + ', '.join(missing) + '. Correct the CSV and retry; no records were cleared.')
+            st.stop()
+        if stream['transaction_id'].isna().any() or stream['transaction_id'].astype(str).str.strip().eq('').any() or stream['transaction_id'].duplicated().any():
+            st.error('STREAM NOT STARTED — transaction IDs are missing or duplicated. Fix the IDs and retry so every case can be traced; no records were cleared.')
             st.stop()
         flagged, unscored, checked = [], [], 0
         box, counts, table = st.empty(), st.empty(), st.empty()
